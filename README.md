@@ -81,3 +81,14 @@ curl -X POST http://localhost:3000/api/device -H 'Content-Type: application/json
 - Cloud AI is optional; errors fall back to demo text. No patient data should be entered.
 - The graph is a simulated ECG illustration, **not a heart measurement**.
 - AI responses may be incorrect; a qualified educator should review teaching material before public use.
+
+
+## Gemini AI version (updated)
+This version uses Google Gemini instead of OpenAI. On Render > Environment set:
+- `DEVICE_TOKEN`: long random string; must match the Arduino sketch.
+- `GEMINI_API_KEY`: your key from https://aistudio.google.com/api-keys (keep secret; never put it in GitHub or Arduino).
+- `GEMINI_MODEL`: `gemini-2.5-flash` or another model your Gemini API account supports.
+
+Render build: `npm install`; start: `npm start`. No additional npm packages are required.
+Without a Gemini key, or if the API fails, the educational demo response is used. Free-tier availability and limits vary.
+The AI responses are for fictional educational simulations, not medical decisions.

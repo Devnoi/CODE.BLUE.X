@@ -6,8 +6,6 @@ import crypto from 'node:crypto';
 const __dirname=path.dirname(fileURLToPath(import.meta.url));
 const PORT=Number(process.env.PORT||3000);
 const TOKEN=process.env.DEVICE_TOKEN||'';
-const OPENAI_KEY=process.env.OPENAI_API_KEY||'';
-const MODEL=process.env.OPENAI_MODEL||'gpt-4o-mini';
 const TOPICS=['airway','circulation','medication'];
 const cases=[
  {id:'anaphylaxis',title:'Anaphylaxis Simulation',patient:'A 22-year-old develops wheezing, widespread hives, dizziness and hypotension minutes after eating peanuts.',vitals:{hr:132,spo2:89,bp:'78/45',rr:30},options:[{id:'a',label:'Give intramuscular epinephrine promptly and activate emergency response',correct:true,reason:'IM epinephrine is first-line treatment for suspected anaphylaxis.'},{id:'b',label:'Give an oral antihistamine only and observe',correct:false,reason:'Antihistamines do not replace epinephrine in anaphylaxis.'},{id:'c',label:'Wait for laboratory confirmation',correct:false,reason:'Treatment should not be delayed for laboratory tests.'}]},
@@ -18,14 +16,46 @@ let state={topic:'airway',lastGesture:'none',distance:0,deviceOnline:false,lastD
 function json(res,status,obj){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','Access-Control-Allow-Origin':'*'});res.end(JSON.stringify(obj));}
 async function body(req){let s='';for await(const part of req){s+=part;if(s.length>12000)throw new Error('Payload too large');}return JSON.parse(s||'{}');}
 function current(){return cases[state.caseIndex%cases.length];}
-function view(){return {...state,deviceOnline:Date.now()-state.lastDeviceAt<20000,case:current(),aiEnabled:!!OPENAI_KEY};}
+function view(){return {...state,deviceOnline:Date.now()-state.lastDeviceAt<20000,case:current(),aiEnabled:!!process.env.GEMINI_API_KEY};}
 function auth(req){if(!TOKEN)return false;const given=req.headers['x-device-token'];if(typeof given!=='string')return false;const a=Buffer.from(given),b=Buffer.from(TOKEN);return a.length===b.length&&crypto.timingSafeEqual(a,b);}
 function nextTopic(){state.topic=TOPICS[(TOPICS.indexOf(state.topic)+1)%TOPICS.length];state.updated=Date.now();}
 function nextCase(){state.caseIndex=(state.caseIndex+1)%cases.length;state.round++;state.lastResult=null;state.updated=Date.now();}
 function offlineExplain(q){const c=current();return `DEMO MODE — ${c.title}. ${c.patient} Prioritize patient safety, call the emergency response team, and follow your institution's protocol. Your question: ${q.slice(0,150)}. This is an educational simulation, not clinical advice.`;}
-async function aiExplain(question){if(!OPENAI_KEY)return {answer:offlineExplain(question),mode:'demo'};
- const ctrl=new AbortController();const timeout=setTimeout(()=>ctrl.abort(),14000);
- try{const r=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',signal:ctrl.signal,headers:{'Authorization':`Bearer ${OPENAI_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({model:MODEL,max_tokens:230,messages:[{role:'system',content:'You are CODE BLUE X, an educational medical simulation facilitator for medical and pharmacy students. Give concise, careful English explanations. Do not provide patient-specific medical advice, definitive diagnoses, drug dosing, or instructions to replace clinicians. Mention emergency escalation where relevant. Keep under 130 words.'},{role:'user',content:`Scenario: ${current().patient}\nQuestion: ${question.slice(0,500)}`}]})});if(!r.ok)throw Error('AI HTTP '+r.status);const d=await r.json();return {answer:d.choices?.[0]?.message?.content||offlineExplain(question),mode:'ai'};}catch(e){return {answer:offlineExplain(question),mode:'demo-fallback'};}finally{clearTimeout(timeout);}}
+async function callGemini(systemPrompt, userPrompt, maxOutputTokens = 300) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not configured');
+  if (!/^[a-zA-Z0-9._-]+$/.test(model)) throw new Error('Invalid GEMINI_MODEL');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      method: 'POST', signal: controller.signal,
+      headers: {'Content-Type':'application/json', 'x-goog-api-key': apiKey},
+      body: JSON.stringify({
+        systemInstruction: {parts:[{text:systemPrompt}]},
+        contents: [{role:'user',parts:[{text:userPrompt}]}],
+        generationConfig: {temperature:0.4, maxOutputTokens}
+      })
+    });
+    if (!response.ok) {
+      const detail = (await response.text()).slice(0, 240);
+      throw new Error(`Gemini HTTP ${response.status}: ${detail}`);
+    }
+    const data = await response.json();
+    const output = data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('').trim();
+    if (!output) throw new Error('Gemini returned no text');
+    return output;
+  } finally { clearTimeout(timer); }
+}
+async function aiExplain(question) {
+  if(!process.env.GEMINI_API_KEY) return {answer:offlineExplain(question),mode:'demo'};
+  try {
+    const systemPrompt='You are CODE BLUE X, an educational medical simulation facilitator for medical and pharmacy students. Give concise, careful English explanations. Do not provide patient-specific medical advice, definitive diagnoses, drug dosing, or instructions to replace clinicians. Mention emergency escalation where relevant. Keep under 130 words.';
+    const output=await callGemini(systemPrompt,`Scenario: ${current().patient}\nQuestion: ${question.slice(0,500)}`,400);
+    return {answer:output,mode:'gemini'};
+  } catch(e) {console.error('Gemini unavailable:',e.message);return {answer:offlineExplain(question),mode:'demo-fallback'};}
+}
 const MIME={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml'};
 const server=http.createServer(async(req,res)=>{try{const u=new URL(req.url,'http://localhost');if(req.method==='GET'&&u.pathname==='/api/state')return json(res,200,view());
 if(req.method==='POST'&&u.pathname==='/api/device'){if(!auth(req))return json(res,401,{error:'Invalid device token'});const data=await body(req);state.lastDeviceAt=Date.now();state.distance=Math.max(0,Math.min(500,Number(data.distance)||0));if(data.gesture==='wave'){nextTopic();state.lastGesture='wave';}return json(res,200,{ok:true,topic:state.topic,round:state.round});}
